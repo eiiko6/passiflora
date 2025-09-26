@@ -10,31 +10,30 @@ use sqlx::PgPool;
 use crate::auth::verify_jwt;
 
 #[derive(sqlx::FromRow, serde::Serialize)]
-pub struct Item {
+pub struct File {
     pub id: i32,
     pub user_id: i32,
     pub name: String,
-    pub value: String,
+    pub mime_type: String,
 }
 
 #[derive(serde::Deserialize)]
-pub struct NewItemPayload {
+pub struct NewFilePayload {
     pub user_id: i32,
     pub name: String,
-    pub value: String,
 }
 
 pub fn routes() -> Router {
     Router::new()
-        .route("/items/{user_id}", get(get_items_for_user))
-        .route("/items", post(create_item))
+        .route("/files/{user_id}", get(get_files_for_user))
+        .route("/files", post(create_file))
 }
 
-async fn get_items_for_user(
+async fn get_files_for_user(
     Path(user_id): Path<i32>,
     headers: HeaderMap,
     Extension(db): Extension<PgPool>,
-) -> Result<Json<Vec<Item>>, (StatusCode, String)> {
+) -> Result<Json<Vec<File>>, (StatusCode, String)> {
     let token = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -46,19 +45,19 @@ async fn get_items_for_user(
         return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
     }
 
-    let items = sqlx::query_as::<_, Item>("SELECT * FROM items WHERE user_id = $1")
+    let files = sqlx::query_as::<_, File>("SELECT * FROM files WHERE user_id = $1")
         .bind(user_id)
         .fetch_all(&db)
         .await
         .unwrap_or_default();
 
-    Ok(Json(items))
+    Ok(Json(files))
 }
 
-async fn create_item(
+async fn create_file(
     Extension(db): Extension<PgPool>,
     headers: HeaderMap,
-    Json(payload): Json<NewItemPayload>,
+    Json(payload): Json<NewFilePayload>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let token = headers
         .get("Authorization")
@@ -78,10 +77,9 @@ async fn create_item(
         ));
     }
 
-    let result = sqlx::query("INSERT INTO items (user_id, name, value) VALUES ($1, $2, $3, $4)")
+    let result = sqlx::query("INSERT INTO files (user_id, name, value) VALUES ($1, $2, $3, $4)")
         .bind(payload.user_id)
         .bind(payload.name)
-        .bind(payload.value)
         .execute(&db)
         .await;
 

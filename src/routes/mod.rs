@@ -1,2 +1,2 @@
-pub mod items;
+pub mod files;
 pub mod users;
