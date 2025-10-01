@@ -7,10 +7,10 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 -- Items table linked to users
-CREATE TABLE IF NOT EXISTS items (
+CREATE TABLE IF NOT EXISTS files (
     id SERIAL PRIMARY KEY,
     user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    value TEXT NOT NULL
+    mime_type TEXT NOT NULL
 );
 

@@ -1,13 +1,20 @@
 use axum::{
     Extension, Json, Router,
-    extract::Path,
+    body::Body,
+    extract::{DefaultBodyLimit, Multipart, Path},
     http::{HeaderMap, StatusCode},
-    routing::get,
-    routing::post,
+    response::Response,
+    routing::{get, post},
 };
 use sqlx::PgPool;
+use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::auth::verify_jwt;
+
+const DEFAULT_UPLOAD_DIR: &str = "./uploads";
 
 #[derive(sqlx::FromRow, serde::Serialize)]
 pub struct File {
@@ -17,19 +24,16 @@ pub struct File {
     pub mime_type: String,
 }
 
-#[derive(serde::Deserialize)]
-pub struct NewFilePayload {
-    pub user_id: i32,
-    pub name: String,
-}
-
 pub fn routes() -> Router {
     Router::new()
-        .route("/files/{user_id}", get(get_files_for_user))
-        .route("/files", post(create_file))
+        .route("/files/{user_id}", get(list_files))
+        .route("/files", post(upload_file))
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(10 * 1000 * 1000 * 10000)) // 100GB
+        .route("/files/{user_id}/{file_id}", get(download_file))
 }
 
-async fn get_files_for_user(
+async fn list_files(
     Path(user_id): Path<i32>,
     headers: HeaderMap,
     Extension(db): Extension<PgPool>,
@@ -54,10 +58,10 @@ async fn get_files_for_user(
     Ok(Json(files))
 }
 
-async fn create_file(
+async fn upload_file(
     Extension(db): Extension<PgPool>,
     headers: HeaderMap,
-    Json(payload): Json<NewFilePayload>,
+    mut multipart: Multipart,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let token = headers
         .get("Authorization")
@@ -65,26 +69,83 @@ async fn create_file(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or((StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
 
+    // Verify auth
     let claims = verify_jwt(token)?;
-    if claims.sub != payload.user_id {
+
+    let upload_dir = std::env::var("PASSIFLORA_DATA_DIR").unwrap_or(DEFAULT_UPLOAD_DIR.to_string());
+
+    while let Some(mut field) = multipart.next_field().await.unwrap() {
+        let name = field.file_name().unwrap_or("file").to_string();
+        let content_type = field.content_type().unwrap_or("application/octet-stream");
+
+        let result = sqlx::query_as::<_, File>(
+            "INSERT INTO files (user_id, name, mime_type) VALUES ($1, $2, $3) RETURNING *",
+        )
+        .bind(claims.sub)
+        .bind(name)
+        .bind(content_type)
+        .fetch_one(&db)
+        .await
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Could not upload file".to_string()))?;
+
+        let save_dir = PathBuf::from(format!("{}/{}", upload_dir, result.user_id));
+        tokio::fs::create_dir_all(&save_dir).await.unwrap();
+        let save_path = save_dir.join(result.id.to_string());
+
+        let mut file = tokio::fs::File::create(&save_path).await.unwrap();
+        while let Some(chunk) = field.chunk().await.unwrap() {
+            file.write_all(&chunk).await.unwrap();
+        }
+    }
+
+    Ok(StatusCode::CREATED)
+}
+
+async fn download_file(
+    Path((user_id, file_id)): Path<(i32, i32)>,
+    headers: HeaderMap,
+    Extension(db): Extension<PgPool>,
+) -> Result<Response, (StatusCode, String)> {
+    let token = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
+
+    // Verify auth
+    let claims = verify_jwt(token)?;
+    if claims.sub != user_id {
         return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
     }
 
-    if payload.name.is_empty() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Name cannot be empty".into(),
-        ));
-    }
+    // Fetch file metadata
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = $1 AND user_id = $2")
+        .bind(file_id)
+        .bind(user_id)
+        .fetch_one(&db)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "File not found".to_string()))?;
 
-    let result = sqlx::query("INSERT INTO files (user_id, name, value) VALUES ($1, $2, $3, $4)")
-        .bind(payload.user_id)
-        .bind(payload.name)
-        .execute(&db)
-        .await;
+    let upload_dir = std::env::var("PASSIFLORA_DATA_DIR").unwrap_or(DEFAULT_UPLOAD_DIR.to_string());
 
-    match result {
-        Ok(_) => Ok(StatusCode::CREATED),
-        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error".into())),
-    }
+    let file_path = PathBuf::from(format!("{}/{}/{}", upload_dir, file.user_id, file.id));
+    let file_handle = tokio::fs::File::open(&file_path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "File not found".to_string()))?;
+
+    let stream = ReaderStream::new(file_handle);
+    let body = Body::from_stream(stream);
+
+    // Build response with headers
+    let mut response = Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert(
+        "Content-Disposition",
+        format!("attachment; filename=\"{}\"", file.name)
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("Content-Type", file.mime_type.parse().unwrap());
+
+    Ok(response)
 }
