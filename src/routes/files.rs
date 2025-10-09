@@ -2,10 +2,11 @@ use axum::{
     Extension, Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Path},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
     routing::{get, post},
 };
+use mime_guess::MimeGuess;
 use sqlx::PgPool;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
@@ -22,6 +23,7 @@ pub struct File {
     pub user_id: i32,
     pub name: String,
     pub mime_type: String,
+    pub size: Option<i32>,
 }
 
 pub fn routes() -> Router {
@@ -76,13 +78,22 @@ async fn upload_file(
 
     while let Some(mut field) = multipart.next_field().await.unwrap() {
         let name = field.file_name().unwrap_or("file").to_string();
-        let content_type = field.content_type().unwrap_or("application/octet-stream");
+        let content_type =
+            // field
+            // .content_type()
+            // .map(|s| s.to_string())
+            // .or_else(|| {
+                MimeGuess::from_path(&name)
+                    .first_raw()
+                    .map(|s| s.to_string())
+            // })
+            .unwrap();
 
         let result = sqlx::query_as::<_, File>(
             "INSERT INTO files (user_id, name, mime_type) VALUES ($1, $2, $3) RETURNING *",
         )
         .bind(claims.sub)
-        .bind(name)
+        .bind(&name)
         .bind(content_type)
         .fetch_one(&db)
         .await
@@ -92,10 +103,26 @@ async fn upload_file(
         tokio::fs::create_dir_all(&save_dir).await.unwrap();
         let save_path = save_dir.join(result.id.to_string());
 
+        let mut size: u32 = 0;
         let mut file = tokio::fs::File::create(&save_path).await.unwrap();
         while let Some(chunk) = field.chunk().await.unwrap() {
+            size += chunk.len() as u32;
             file.write_all(&chunk).await.unwrap();
         }
+
+        tracing::info!("Uploaded {}!", &name);
+
+        let _ = sqlx::query_as::<_, File>("UPDATE files SET size = $1 WHERE id = $2")
+            .bind(size as i32)
+            .bind(result.id)
+            .fetch_one(&db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not upload file".to_string(),
+                )
+            });
     }
 
     Ok(StatusCode::CREATED)

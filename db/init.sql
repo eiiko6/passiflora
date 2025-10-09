@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS files (
     id SERIAL PRIMARY KEY,
     user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    mime_type TEXT NOT NULL
+    mime_type TEXT NOT NULL,
+    size INT
 );
 
